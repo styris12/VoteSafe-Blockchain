@@ -65,7 +65,7 @@ export default function Home() {
   const phaseColor = PHASE_COLORS[phaseNum] || '#ffcc00';
 
   // ── STYLES ──────────────────────────────────────
-  const page    = { height:'100vh', background:'#060d16', color:'#ddeeff', fontFamily:"'Courier New', monospace", fontSize:14, display:'flex', flexDirection:'column' };
+  const page    = { minHeight:'100vh', background:'#060d16', color:'#ddeeff', fontFamily:"'Courier New', monospace", fontSize:14, display:'flex', flexDirection:'column' };
   const panel   = { background:'#0a1828', border:'1px solid #1a3a52', borderRadius:8, overflow:'hidden', display:'flex', flexDirection:'column' };
   const ph      = (x={}) => ({ padding:'12px 18px', borderBottom:'1px solid #1a3a52', background:'rgba(0,212,255,0.05)', display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0, ...x });
   const pt      = { fontSize:13, fontWeight:800, color:'#00d4ff', letterSpacing:2, textTransform:'uppercase' };

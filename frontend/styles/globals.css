@@ -5,17 +5,41 @@
 @tailwind utilities;
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { height: 100%; overflow: hidden; }
-body { height: 100%; overflow: hidden; margin: 0; padding: 0; background: #060d16; font-family: 'Courier New', Courier, monospace; }
-#__next { height: 100%; overflow: hidden; display: flex; flex-direction: column; margin: 0; padding: 0 }
-::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #0a1520; }
-::-webkit-scrollbar-thumb { background: #1e5a82; border-radius: 3px; }
-html, body, #__next {
-  height: 100%;
-  overflow: hidden; /* THIS kills scrolling */
-  background: #050a0e;
+
+/* 1. Remove overflow: hidden to allow the page to scroll */
+html { 
+  min-height: 100%; 
+  overflow-y: auto; 
 }
-body {
-  font-family: 'Arial', 'Helvetica', sans-serif;
+
+/* 2. Change height: 100% to min-height so the body can expand */
+body { 
+  min-height: 100%; 
+  overflow-y: auto; 
+  margin: 0; 
+  padding: 0; 
+  background: #050a0e; 
+  font-family: 'Arial', 'Helvetica', sans-serif; 
+}
+
+/* 3. Allow the Next.js wrapper to grow with the content */
+#__next { 
+  min-height: 100vh; 
+  display: flex; 
+  flex-direction: column; 
+}
+
+/* Scrollbar Styling - Keep your cool tech look */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #0a1520; }
+::-webkit-scrollbar-thumb { 
+  background: #1e5a82; 
+  border-radius: 4px; 
+}
+::-webkit-scrollbar-thumb:hover { background: #2a7db5; }
+
+/* 4. Add some padding to the bottom of your main content 
+      so the Green Button isn't touching the very edge */
+main {
+  padding-bottom: 4rem;
 }
