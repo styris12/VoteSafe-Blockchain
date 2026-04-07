@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { ethers } from 'ethers';
 import { useVoting } from '../hooks/useVoting';
 import { CONTRACT_ADDRESS } from '../contracts/config';
+import { fetchVoteEvents, buildMerkleTree, getMerkleProof } from '../utils/merkle';
 
 const maskAddress = (addr) => addr ? `${addr.slice(0,6)}...${addr.slice(-4)}` : '';
 const COLORS = ['#00d4ff','#00ff88','#ffcc00','#ff7733','#cc44ff'];
@@ -13,10 +14,14 @@ const DEMO_VOTERS = [
   { label:'Voter 2', address:'0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC', pk:'0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a' },
   { label:'Voter 3', address:'0x90F79bf6EB2c4f870365E785982E1f101E93b906', pk:'0x7c852118294e51e653712a81e05800f419141751be58f605c371e15141b007a6' },
   { label:'Voter 4', address:'0x15d34AAf54267DB7D7c367839AAf71A00a2C6A65', pk:'0x47e179ec197488593b187f80a00eb0da91f1b9d0b13f8733639f19c30a34926a' },
+  { label:'Voter 5', address:'0x9965507D1a55bcC2695C58ba16FB37d819B0A4dc', pk:'0x8b3a350cf5c34c9194ca85829a2df0ec3153be0318b5e2d3348e872092edffba' },
+  { label:'Voter 6', address:'0x976EA74026E726554dB657fA54763abd0C3a0aa9', pk:'0x92db14e403b83dfe3df233f83dfa3a0d7096f21ca9b0d6d6b8d88b2b4ec1564e' },
+  { label:'Voter 7', address:'0x14dC79964da2C08b23698B3D3cc7Ca32193d9955', pk:'0x4bbbf85ce3377467afe5d46f804f221813b2bb87f24d81f60f1fcdbf7cbf4356' },  
 ];
 
 const AVATARS    = ['🧑','👩','👨','🧔','👩‍💼','👨‍💼','🧑‍💻','👩‍🔬','👨‍🎓','🧑‍🎨'];
 const CAND_ICONS = ['🏛️','⚡','🌿','🔥','💡','🎯','🌊','🦅'];
+const NODE_COLOR = { root:'#ffcc00', internal:'#0088cc', leaf:'#00d4ff', highlight:'#00ff88', proof:'#ff7733' };
 
 export default function Home() {
   const {
@@ -57,14 +62,165 @@ export default function Home() {
   const [simLoading, setSimLoading] = useState(false);
   const [simMsg, setSimMsg]         = useState('');
 
+  // ── PHASE TIMER ──────────────────────────────────────────────────────────
+  const [timerDuration, setTimerDuration] = useState(5);
+  const [timerEnd, setTimerEnd]           = useState(null);
+  const [timeLeft, setTimeLeft]           = useState(null);
+
+  // ── MERKLE TREE ──────────────────────────────────────────────────────────
+  const [merkleTree, setMerkleTree]         = useState(null);
+  const [merkleLoading, setMerkleLoading]   = useState(false);
+  const [merkleError, setMerkleError]       = useState('');
+  const [selectedNode, setSelectedNode]     = useState(null);
+  const [highlightProof, setHighlightProof] = useState([]);
+  const svgRef = useRef(null);
+
+  // useEffect 1 — hydration guard
   useEffect(() => { setReady(true); }, []);
+
+  // useEffect 2 — countdown tick
+  useEffect(() => {
+    if (!timerEnd) return;
+    const interval = setInterval(() => {
+      const remaining = Math.max(0, Math.floor((timerEnd - Date.now()) / 1000));
+      setTimeLeft(remaining);
+      if (remaining === 0) clearInterval(interval);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [timerEnd]);
+
+  // useEffect 3 — auto-load merkle when tab opens
+  useEffect(() => {
+    if (tab === 'merkle' && contract && candidates.length > 0) {
+      loadMerkleTree();
+    }
+  }, [tab, contract]); // eslint-disable-line
+
   if (!ready) return null;
 
   const phaseNum   = currentPhase ?? 0;
   const phaseLabel = PHASES[phaseNum]       || 'REGISTRATION';
   const phaseColor = PHASE_COLORS[phaseNum] || '#ffcc00';
 
-  // ── STYLES ──────────────────────────────────────
+  const formatTime = (secs) => {
+    const m = String(Math.floor(secs / 60)).padStart(2, '0');
+    const s = String(secs % 60).padStart(2, '0');
+    return `${m}:${s}`;
+  };
+
+  // ── MERKLE HELPERS ───────────────────────────────────────────────────────
+  const loadMerkleTree = async () => {
+    if (!contract) return;
+    setMerkleLoading(true);
+    setMerkleError('');
+    setSelectedNode(null);
+    setHighlightProof([]);
+    try {
+      const events = await fetchVoteEvents(contract);
+      if (events.length === 0) {
+        setMerkleTree(null);
+        setMerkleError('No votes cast yet. Cast some votes first, then come back.');
+      } else {
+        const tree = await buildMerkleTree(events, candidates);
+        setMerkleTree(tree);
+      }
+    } catch (e) {
+      setMerkleError('Failed to build Merkle tree: ' + e.message);
+    } finally {
+      setMerkleLoading(false);
+    }
+  };
+
+  const handleNodeClick = (node) => {
+    setSelectedNode(node);
+    if (node.type === 'leaf' && merkleTree) {
+      const proof = getMerkleProof(merkleTree, node.index);
+      setHighlightProof(proof.map(p => p.hash));
+    } else {
+      setHighlightProof([]);
+    }
+  };
+
+  // ── MERKLE SVG ───────────────────────────────────────────────────────────
+  const renderMerkleTree = () => {
+    if (!merkleTree) return null;
+    const { levels } = merkleTree;
+    const svgWidth  = 900;
+    const levelH    = 110;
+    const svgHeight = levels.length * levelH + 80;
+    const nodeR     = 28;
+
+    // Render root at top → levels reversed
+    const reversedLevels = [...levels].reverse();
+
+    const positions = reversedLevels.map((level, lvlIdx) => {
+      const count  = level.length;
+      const spread = Math.min(svgWidth - 80, count * 140);
+      const startX = (svgWidth - spread) / 2 + (count > 1 ? spread / (count * 2) : 0);
+      return level.map((node, i) => ({
+        x: count === 1 ? svgWidth / 2 : startX + (i / (count - 1)) * (spread - spread / count),
+        y: 50 + lvlIdx * levelH,
+        node,
+      }));
+    });
+
+    const edges = [];
+    for (let lvl = 0; lvl < reversedLevels.length - 1; lvl++) {
+      positions[lvl].forEach((pp) => {
+        if (!pp.node.children) return;
+        pp.node.children.forEach((child) => {
+          const cp = positions[lvl + 1].find(c => c.node.hash === child.hash);
+          if (!cp) return;
+          const isProof = highlightProof.includes(child.hash);
+          edges.push(
+            <line key={`${pp.node.hash}-${cp.node.hash}`}
+              x1={pp.x} y1={pp.y} x2={cp.x} y2={cp.y}
+              stroke={isProof ? NODE_COLOR.proof : '#1a3a52'}
+              strokeWidth={isProof ? 2.5 : 1.5}
+              strokeDasharray={isProof ? '6 3' : 'none'}
+            />
+          );
+        });
+      });
+    }
+
+    const nodes = positions.flat().map(({ x, y, node }) => {
+      const isSelected  = selectedNode?.hash === node.hash;
+      const isProofNode = highlightProof.includes(node.hash);
+      const color =
+        isSelected  ? NODE_COLOR.highlight :
+        isProofNode ? NODE_COLOR.proof :
+        node.type === 'root'     ? NODE_COLOR.root :
+        node.type === 'internal' ? NODE_COLOR.internal :
+        NODE_COLOR.leaf;
+
+      const label =
+        node.type === 'root'     ? '🏆' :
+        node.type === 'internal' ? '🔗' :
+        `V${node.index + 1}`;
+
+      return (
+        <g key={node.hash} onClick={() => handleNodeClick(node)} style={{ cursor: 'pointer' }}>
+          {isSelected && <circle cx={x} cy={y} r={nodeR + 8} fill="none" stroke={color} strokeWidth={2} opacity={0.35}/>}
+          <circle cx={x} cy={y} r={nodeR} fill={`${color}22`} stroke={color} strokeWidth={isSelected ? 3 : 2}/>
+          <text x={x} y={y - 3} textAnchor="middle" fontSize={node.type === 'root' ? 16 : 12}
+            fontWeight="700" fill={color} fontFamily="'Courier New', monospace">{label}</text>
+          <text x={x} y={y + 12} textAnchor="middle" fontSize={8}
+            fill={`${color}99`} fontFamily="'Courier New', monospace">{node.hash.slice(0,6)}…</text>
+        </g>
+      );
+    });
+
+    return (
+      <svg ref={svgRef} width="100%" viewBox={`0 0 ${svgWidth} ${svgHeight}`}
+        style={{ background:'#060d16', borderRadius:8, border:'1px solid #1a3a52', display:'block' }}>
+        {edges}
+        {nodes}
+      </svg>
+    );
+  };
+
+  // ── STYLES ───────────────────────────────────────────────────────────────
   const page    = { minHeight:'100vh', background:'#060d16', color:'#ddeeff', fontFamily:"'Courier New', monospace", fontSize:14, display:'flex', flexDirection:'column' };
   const panel   = { background:'#0a1828', border:'1px solid #1a3a52', borderRadius:8, overflow:'hidden', display:'flex', flexDirection:'column' };
   const ph      = (x={}) => ({ padding:'12px 18px', borderBottom:'1px solid #1a3a52', background:'rgba(0,212,255,0.05)', display:'flex', alignItems:'center', justifyContent:'space-between', flexShrink:0, ...x });
@@ -88,12 +244,10 @@ export default function Home() {
   const lbl     = { display:'block', fontSize:10, color:'#4a7a9b', letterSpacing:1.8, textTransform:'uppercase', marginBottom:4 };
 
   const mkBtn = (v='primary', full=true, sm=false) => ({
-    width: full?'100%':'auto',
-    padding: sm?'7px 12px':'12px 18px',
-    border:'none', borderRadius:10,
-    fontSize: sm?12:14, fontWeight:700, letterSpacing:1.5, cursor:'pointer',
-    fontFamily:"'Segoe UI', Tahoma, sans-serif", transition:'all 0.15s',
-    display:'flex', alignItems:'center', justifyContent:'center', gap:6,
+    width: full?'100%':'auto', padding: sm?'7px 12px':'12px 18px',
+    border:'none', borderRadius:10, fontSize: sm?12:14, fontWeight:700,
+    letterSpacing:1.5, cursor:'pointer', fontFamily:"'Segoe UI', Tahoma, sans-serif",
+    transition:'all 0.15s', display:'flex', alignItems:'center', justifyContent:'center', gap:6,
     ...(v==='green'  ? { background:'linear-gradient(135deg,#006633,#004422)', border:'1px solid #00994d', color:'#e8f4f8' }
       : v==='red'    ? { background:'linear-gradient(135deg,#881122,#550011)', border:'1px solid #aa1133', color:'#e8f4f8' }
       : v==='yellow' ? { background:'linear-gradient(135deg,#886600,#554400)', border:'1px solid #aa8800', color:'#e8f4f8' }
@@ -101,7 +255,7 @@ export default function Home() {
       :                { background:'linear-gradient(135deg,#005577,#003344)', border:'1px solid #0088aa', color:'#e8f4f8' }),
   });
 
-  // ── SIMULATION HELPERS ───────────────────────────
+  // ── SIMULATION HELPERS ───────────────────────────────────────────────────
   const checkSimVoter = async (voter) => {
     if (!contract) return;
     try {
@@ -125,9 +279,9 @@ export default function Home() {
     setSimLoading(true); setSimMsg('');
     try {
       const provider = new ethers.JsonRpcProvider('http://127.0.0.1:8545');
-      const wallet = new ethers.Wallet(simVoter.pk, provider);
-      const c = contract.connect(wallet);
-      const tx = await c.castVote(simSel);
+      const wallet   = new ethers.Wallet(simVoter.pk, provider);
+      const c        = contract.connect(wallet);
+      const tx       = await c.castVote(simSel);
       await tx.wait();
       setSimTxHash(tx.hash);
       setSimStep('done');
@@ -135,14 +289,14 @@ export default function Home() {
     } catch(e) {
       const m = e?.reason||e?.message||'';
       setSimMsg(
-        m.includes('Already voted')       ? '⚠ Already voted.' :
-        m.includes('Not authorized')      ? '⚠ Not authorized — ask admin to whitelist this wallet.' :
-        m.includes('Wrong election phase')? '⚠ Not in voting phase.' : m
+        m.includes('Already voted')        ? '⚠ Already voted.' :
+        m.includes('Not authorized')       ? '⚠ Not authorized — ask admin to whitelist this wallet.' :
+        m.includes('Wrong election phase') ? '⚠ Not in voting phase.' : m
       );
     } finally { setSimLoading(false); }
   };
 
-  // ── ADMIN HELPERS ────────────────────────────────
+  // ── ADMIN HELPERS ────────────────────────────────────────────────────────
   const handleAddCandidate = async () => {
     if (!candName.trim()) { setCandMsg('Enter candidate name.'); return; }
     const ok = await addCandidate(`${candIcon} ${candName}`, candParty||'Independent');
@@ -162,12 +316,24 @@ export default function Home() {
 
   const handleStartVoting = async () => {
     const ok = await startVoting();
-    setPhaseMsg(ok ? '✓ Voting phase started.' : 'Failed — need 2+ candidates and 1+ voter.');
+    if (ok) {
+      setTimerEnd(Date.now() + timerDuration * 60 * 1000);
+      setTimeLeft(timerDuration * 60);
+      setPhaseMsg('✓ Voting phase started.');
+    } else {
+      setPhaseMsg('Failed — need 2+ candidates and 1+ voter.');
+    }
   };
 
   const handleEndVoting = async () => {
     const ok = await endVoting();
-    setPhaseMsg(ok ? '✓ Election ended. Results finalized.' : 'Failed to end election.');
+    if (ok) {
+      setTimerEnd(null);
+      setTimeLeft(null);
+      setPhaseMsg('✓ Election ended. Results finalized.');
+    } else {
+      setPhaseMsg('Failed to end election.');
+    }
   };
 
   const handleVote = async () => {
@@ -177,7 +343,7 @@ export default function Home() {
     if (hash) { setTxHash(hash); setVoteMsg('✓ Vote confirmed on blockchain!'); }
   };
 
-  // ── CONNECT SCREEN ───────────────────────────────
+  // ── CONNECT SCREEN ───────────────────────────────────────────────────────
   if (!account) {
     return (
       <div style={{ ...page, alignItems:'center', justifyContent:'center' }}>
@@ -199,7 +365,7 @@ export default function Home() {
     );
   }
 
-  // ── MAIN APP ─────────────────────────────────────
+  // ── MAIN APP ─────────────────────────────────────────────────────────────
   return (
     <div style={page}>
 
@@ -213,6 +379,12 @@ export default function Home() {
           </div>
         </div>
         <div style={{ display:'flex', alignItems:'center', gap:14 }}>
+          {/* TIMER BADGE */}
+          {phaseNum === 1 && timeLeft !== null && (
+            <span style={{ padding:'5px 14px', background:timeLeft===0?'rgba(255,51,85,0.15)':'rgba(255,204,0,0.1)', border:`1px solid ${timeLeft===0?'#cc1133':'#aa8800'}`, borderRadius:20, fontSize:13, color:timeLeft===0?'#ff4466':'#ffcc00', fontWeight:700, letterSpacing:1, fontFamily:"'Courier New', monospace", minWidth:90, textAlign:'center' }}>
+              {timeLeft===0?'⏰ TIME UP':`⏱ ${formatTime(timeLeft)}`}
+            </span>
+          )}
           <span style={{ padding:'5px 14px', background:`rgba(${phaseNum===0?'255,204,0':phaseNum===1?'0,255,136':'74,122,155'},0.1)`, border:`1px solid ${phaseColor}55`, borderRadius:20, fontSize:12, color:phaseColor, fontWeight:700, letterSpacing:1 }}>
             {phaseNum===0?'📋':phaseNum===1?'🗳':'🏁'} {phaseLabel}
           </span>
@@ -230,26 +402,18 @@ export default function Home() {
 
       {/* INFO BAR */}
       <div style={{ display:'flex', alignItems:'center', gap:0, fontFamily:"Arial, Helvetica, sans-serif", padding:'0 26px', height:38, background:'#050b14', borderBottom:'2px solid #0d2030', flexShrink:0, fontSize:13, overflow:'hidden' }}>
-        {[
-          ['CONTRACT', maskAddress(CONTRACT_ADDRESS)],
-          ['ELECTION', electionTitle||'—'],
-          ['PHASE', phaseLabel, phaseColor],
-          ['VOTES', String(totalVotes)],
-          ['CANDIDATES', String(candidates.length)],
-          ['NETWORK', 'Hardhat Local · 127.0.0.1:8545'],
-        ].map(([k,v,vc],i) => (
+        {[['CONTRACT',maskAddress(CONTRACT_ADDRESS)],['ELECTION',electionTitle||'—'],['PHASE',phaseLabel,phaseColor],['VOTES',String(totalVotes)],['CANDIDATES',String(candidates.length)],['NETWORK','Hardhat Local · 127.0.0.1:8545']].map(([k,v,vc],i)=>(
           <div key={i} style={{ display:'flex', alignItems:'center', gap:7, paddingRight:22, borderRight:'1px solid #0d2030', marginRight:22, whiteSpace:'nowrap' }}>
-            <span style={{ color:'#2a6a8a' }}>{k}</span>
-            <span style={{ color:vc||'#7ab8cc' }}>{v}</span>
+            <span style={{ color:'#2a6a8a' }}>{k}</span><span style={{ color:vc||'#7ab8cc' }}>{v}</span>
           </div>
         ))}
       </div>
 
       {/* TABS */}
       <div style={{ display:'flex', alignItems:'stretch', padding:'0 28px', height:46, background:'#050b14', borderBottom:'1px solid #0d2030', flexShrink:0 }}>
-        {['voter','results',...(isAdmin?['admin']:[])].map(t => (
+        {['voter','results','merkle',...(isAdmin?['admin']:[])].map(t=>(
           <button key={t} onClick={()=>setTab(t)} style={{ padding:'0 24px', fontSize:13, fontWeight:700, letterSpacing:2, textTransform:'uppercase', border:'none', borderBottom:tab===t?'2px solid #00d4ff':'2px solid transparent', color:tab===t?'#00d4ff':'#4a7a9b', background:tab===t?'rgba(0,212,255,0.04)':'transparent', cursor:'pointer', fontFamily:"Arial, Helvetica, sans-serif", transition:'all 0.15s', display:'flex', alignItems:'center', gap:7 }}>
-            {t==='voter'?'🗳 Voter Booth':t==='results'?'📊 Live Results':'⚙ Admin Panel'}
+            {t==='voter'?'🗳 Voter Booth':t==='results'?'📊 Live Results':t==='merkle'?'🌳 Merkle Tree':'⚙ Admin Panel'}
           </button>
         ))}
         <button onClick={fetchElectionData} style={{ marginLeft:'auto', padding:'8px 16px', background:'transparent', border:'1px solid #1a3a52', borderRadius:4, color:'#4a7a9b', fontSize:12, cursor:'pointer', alignSelf:'center' }}>↻ Refresh</button>
@@ -262,30 +426,21 @@ export default function Home() {
         {/* ══ VOTER TAB ══ */}
         {tab==='voter' && (
           <div style={{ display:'grid', gridTemplateColumns:'240px 1fr', gap:16, height:'100%' }}>
-
-            {/* LEFT COLUMN — Voting Mode + Election Info only, no wallet status */}
             <div style={{ display:'flex', flexDirection:'column', gap:12, height:'100%' }}>
-
-              {/* Voting Mode */}
               <div style={{ ...panel, flex:'0 0 auto' }}>
                 <div style={ph()}><span style={pt}>Voting Mode</span></div>
                 <div style={{ padding:12, display:'flex', flexDirection:'column', gap:8 }}>
                   <button onClick={()=>setSimMode(false)} style={{ ...mkBtn(simMode?'ghost':'primary',true,true) }}>🦊 MetaMask Wallet</button>
                   <button onClick={()=>{ setSimMode(true); setSimStep('select'); setSimVoter(null); }} style={{ ...mkBtn(simMode?'primary':'ghost',true,true) }}>👥 Voter Simulation</button>
-                  <div style={{ fontSize:11, color:'#4a7a9b', lineHeight:1.7, marginTop:4 }}>
-                    Simulation lets you vote as different accounts without changing MetaMask.
-                  </div>
+                  <div style={{ fontSize:11, color:'#4a7a9b', lineHeight:1.7, marginTop:4 }}>Simulation lets you vote as different accounts without changing MetaMask.</div>
                 </div>
               </div>
-
-              {/* Sim voter selector — only when sim mode */}
               {simMode && (
                 <div style={{ ...panel, flex:1 }}>
                   <div style={ph()}><span style={pt}>Select Voter</span></div>
                   <div style={{ padding:10, display:'flex', flexDirection:'column', gap:6, overflow:'auto' }}>
                     {DEMO_VOTERS.map((v,i)=>(
-                      <button key={v.address} onClick={()=>handleSimSelect(v)}
-                        style={{ ...mkBtn(simVoter?.address===v.address?'primary':'ghost',true,false), justifyContent:'flex-start', gap:10 }}>
+                      <button key={v.address} onClick={()=>handleSimSelect(v)} style={{ ...mkBtn(simVoter?.address===v.address?'primary':'ghost',true,false), justifyContent:'flex-start', gap:10 }}>
                         <span style={{ fontSize:20 }}>{AVATARS[i]}</span>
                         <div style={{ textAlign:'left' }}>
                           <div style={{ fontSize:13, fontWeight:700 }}>{v.label}</div>
@@ -296,8 +451,6 @@ export default function Home() {
                   </div>
                 </div>
               )}
-
-              {/* Election Info — always visible, fills remaining space */}
               <div style={{ ...panel, flex:1 }}>
                 <div style={ph()}><span style={pt}>Election Info</span></div>
                 <div style={pb}>
@@ -323,13 +476,9 @@ export default function Home() {
                   )}
                 </div>
               </div>
-
             </div>
 
-            {/* RIGHT: voting panel */}
             <div style={panel}>
-
-              {/* MetaMask voting */}
               {!simMode && (
                 <>
                   <div style={ph()}>
@@ -370,8 +519,7 @@ export default function Home() {
                           ))}
                         </div>
                         <div style={{ marginTop:'auto', paddingTop:14 }}>
-                          <button style={{ ...mkBtn('green'), opacity:(loading||phaseNum!==1||!voterStatus?.authorized)?0.35:1 }}
-                            onClick={handleVote} disabled={loading||phaseNum!==1||!voterStatus?.authorized}>
+                          <button style={{ ...mkBtn('green'), opacity:(loading||phaseNum!==1||!voterStatus?.authorized)?0.35:1 }} onClick={handleVote} disabled={loading||phaseNum!==1||!voterStatus?.authorized}>
                             {loading?'⏳ Mining Block...':'⛓ Cast Vote on Blockchain'}
                           </button>
                           {voteMsg && <div style={{ marginTop:8, fontSize:13, color:voteMsg.startsWith('✓')?'#00ff88':'#ff4466' }}>{voteMsg}</div>}
@@ -381,8 +529,6 @@ export default function Home() {
                   </div>
                 </>
               )}
-
-              {/* Voter simulation */}
               {simMode && (
                 <>
                   <div style={ph()}>
@@ -390,21 +536,13 @@ export default function Home() {
                     {simVoter && <span style={{ fontSize:11, color:'#4a7a9b' }}>{simStep.toUpperCase()}</span>}
                   </div>
                   <div style={pb}>
-                    {!simVoter && (
-                      <div style={{ textAlign:'center', padding:48, color:'#4a7a9b' }}>
-                        <div style={{ fontSize:36, marginBottom:12 }}>👈</div>
-                        <div style={{ fontSize:14 }}>Select a voter from the left panel to begin simulation</div>
-                      </div>
-                    )}
-
+                    {!simVoter && (<div style={{ textAlign:'center', padding:48, color:'#4a7a9b' }}><div style={{ fontSize:36, marginBottom:12 }}>👈</div><div style={{ fontSize:14 }}>Select a voter from the left panel to begin simulation</div></div>)}
                     {simVoter && simStep==='register' && (
                       <>
                         <div style={aInf}>Complete identity verification to proceed.</div>
                         <label style={lbl}>Your Avatar</label>
                         <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginBottom:10 }}>
-                          {AVATARS.map(a=>(
-                            <button key={a} onClick={()=>setSimAvatar(a)} style={{ width:34, height:34, borderRadius:6, border:`2px solid ${simAvatar===a?'#00d4ff':'#1a3a52'}`, background:simAvatar===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:17, cursor:'pointer' }}>{a}</button>
-                          ))}
+                          {AVATARS.map(a=>(<button key={a} onClick={()=>setSimAvatar(a)} style={{ width:34, height:34, borderRadius:6, border:`2px solid ${simAvatar===a?'#00d4ff':'#1a3a52'}`, background:simAvatar===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:17, cursor:'pointer' }}>{a}</button>))}
                         </div>
                         <label style={lbl}>Full Name</label>
                         <input style={inp} value={simName} onChange={e=>setSimName(e.target.value)} placeholder="Enter your full name"/>
@@ -421,7 +559,6 @@ export default function Home() {
                         </div>
                       </>
                     )}
-
                     {simVoter && simStep==='vote' && (
                       <>
                         <div style={{ padding:12, background:'rgba(0,255,136,0.04)', border:'1px solid #004422', borderRadius:6, marginBottom:14, display:'flex', alignItems:'center', gap:12 }}>
@@ -448,8 +585,7 @@ export default function Home() {
                               </div>
                             ))}
                             <div style={{ marginTop:'auto', paddingTop:14 }}>
-                              <button style={{ ...mkBtn('green'), opacity:(simLoading||phaseNum!==1)?0.35:1 }}
-                                onClick={handleSimVote} disabled={simLoading||phaseNum!==1}>
+                              <button style={{ ...mkBtn('green'), opacity:(simLoading||phaseNum!==1)?0.35:1 }} onClick={handleSimVote} disabled={simLoading||phaseNum!==1}>
                                 {simLoading?'⏳ Mining Block...':'⛓ Cast Vote on Blockchain'}
                               </button>
                               {simMsg && <div style={{ marginTop:8, fontSize:13, color:simMsg.startsWith('✓')?'#00ff88':'#ff4466' }}>{simMsg}</div>}
@@ -458,7 +594,6 @@ export default function Home() {
                         )}
                       </>
                     )}
-
                     {simVoter && simStep==='done' && (
                       <div>
                         <div style={{ textAlign:'center', padding:'20px 0 16px' }}>
@@ -488,10 +623,7 @@ export default function Home() {
         {tab==='results' && (
           <div style={{ display:'grid', gridTemplateColumns:'1fr 300px', gap:18, height:'100%' }}>
             <div style={panel}>
-              <div style={ph()}>
-                <span style={pt}>Live Vote Tally</span>
-                <span style={{ fontSize:13, ...muted }}>{totalVotes} votes cast</span>
-              </div>
+              <div style={ph()}><span style={pt}>Live Vote Tally</span><span style={{ fontSize:13, ...muted }}>{totalVotes} votes cast</span></div>
               <div style={pb}>
                 {phaseNum===2 && winner && (
                   <div style={{ padding:20, background:'linear-gradient(135deg,rgba(255,204,0,0.1),rgba(255,204,0,0.05))', border:'2px solid #ffcc0055', borderRadius:10, marginBottom:20, textAlign:'center' }}>
@@ -555,10 +687,148 @@ export default function Home() {
           </div>
         )}
 
+        {/* ══ MERKLE TREE TAB ══ */}
+        {tab==='merkle' && (
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 320px', gap:16, height:'100%' }}>
+            {/* LEFT: SVG tree */}
+            <div style={panel}>
+              <div style={ph()}>
+                <span style={pt}>🌳 Merkle Vote Tree</span>
+                <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+                  {merkleTree && <span style={{ fontSize:11, ...muted }}>{merkleTree.totalLeaves} votes · {merkleTree.levels.length} levels</span>}
+                  <button onClick={loadMerkleTree} style={{ padding:'4px 12px', background:'transparent', border:'1px solid #1a3a52', borderRadius:4, color:'#4a7a9b', fontSize:11, cursor:'pointer' }}>↻ Rebuild</button>
+                </div>
+              </div>
+              <div style={{ ...pb, alignItems:'stretch' }}>
+                {merkleLoading && (
+                  <div style={{ textAlign:'center', padding:60, color:'#4a7a9b' }}>
+                    <div style={{ fontSize:36, marginBottom:12 }}>⏳</div>
+                    <div>Fetching vote events from blockchain...</div>
+                  </div>
+                )}
+                {!merkleLoading && merkleError && <div style={{ ...aWarn, margin:20 }}>{merkleError}</div>}
+                {!merkleLoading && !merkleError && !merkleTree && (
+                  <div style={{ textAlign:'center', padding:60, color:'#4a7a9b' }}>
+                    <div style={{ fontSize:48, marginBottom:12 }}>🌳</div>
+                    <div style={{ fontSize:14, marginBottom:8 }}>No votes cast yet.</div>
+                    <div style={{ fontSize:12 }}>Cast votes in Voter Booth, then come back here.</div>
+                  </div>
+                )}
+                {!merkleLoading && merkleTree && (
+                  <div style={{ flex:1, overflow:'auto' }}>
+                    {renderMerkleTree()}
+                    {/* Legend */}
+                    <div style={{ display:'flex', gap:16, padding:'10px 4px', flexWrap:'wrap' }}>
+                      {[[NODE_COLOR.root,'🏆 Root — final Merkle fingerprint'],[NODE_COLOR.internal,'🔗 Internal — combined hash'],[NODE_COLOR.leaf,'V# Leaf — one vote'],[NODE_COLOR.proof,'🔶 Merkle proof path'],[NODE_COLOR.highlight,'Selected node']].map(([color,label])=>(
+                        <div key={label} style={{ display:'flex', alignItems:'center', gap:6, fontSize:11, color:'#4a7a9b' }}>
+                          <span style={{ width:10, height:10, borderRadius:'50%', background:color, display:'inline-block', flexShrink:0 }}></span>{label}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* RIGHT: details + root */}
+            <div style={{ display:'flex', flexDirection:'column', gap:12, height:'100%' }}>
+              {/* Merkle Root */}
+              <div style={{ ...panel, flex:'0 0 auto' }}>
+                <div style={ph()}><span style={pt}>Merkle Root</span></div>
+                <div style={{ padding:14 }}>
+                  {merkleTree ? (
+                    <>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:6 }}>ROOT HASH</div>
+                      <div style={{ fontSize:11, color:'#ffcc00', fontFamily:"'Courier New', monospace", wordBreak:'break-all', lineHeight:1.7, background:'rgba(255,204,0,0.05)', border:'1px solid #aa880044', borderRadius:6, padding:'8px 10px' }}>{merkleTree.merkleRoot}</div>
+                      <div style={{ fontSize:11, color:'#4a7a9b', marginTop:10, lineHeight:1.7 }}>
+                        This hash represents <span style={{ color:'#00d4ff' }}>all {merkleTree.totalLeaves} votes</span>. Changing even one vote would completely change this root — tampering is instantly detectable.
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ fontSize:12, color:'#4a7a9b' }}>Cast votes to generate the Merkle root.</div>
+                  )}
+                </div>
+              </div>
+
+              {/* Node Detail */}
+              <div style={{ ...panel, flex:1 }}>
+                <div style={ph()}>
+                  <span style={pt}>Node Details</span>
+                  {selectedNode && <span style={{ fontSize:10, padding:'3px 8px', borderRadius:10, background:`${NODE_COLOR[selectedNode.type]}22`, border:`1px solid ${NODE_COLOR[selectedNode.type]}55`, color:NODE_COLOR[selectedNode.type] }}>{selectedNode.type.toUpperCase()}</span>}
+                </div>
+                <div style={pb}>
+                  {!selectedNode && (
+                    <div style={{ textAlign:'center', padding:30, color:'#4a7a9b' }}>
+                      <div style={{ fontSize:28, marginBottom:10 }}>👆</div>
+                      <div style={{ fontSize:13 }}>Click any node in the tree to see its details</div>
+                      <div style={{ fontSize:11, marginTop:8, lineHeight:1.8 }}>
+                        <span style={{ color:NODE_COLOR.leaf }}>V# nodes</span> = individual votes<br/>
+                        <span style={{ color:NODE_COLOR.internal }}>🔗 nodes</span> = combined hashes<br/>
+                        <span style={{ color:NODE_COLOR.root }}>🏆 root</span> = tamper-proof fingerprint
+                      </div>
+                    </div>
+                  )}
+
+                  {selectedNode?.type === 'leaf' && (
+                    <div style={row}>
+                      <div style={{ fontSize:11, color:'#4a7a9b', letterSpacing:1.5, marginBottom:8 }}>VOTE LEAF #{selectedNode.index + 1}</div>
+                      <div><span style={key}>Voter ......... </span><span style={{ ...cyan, fontSize:11 }}>{selectedNode.voter}</span></div>
+                      <div><span style={key}>Candidate ..... </span><span style={val}>{selectedNode.candidateName}</span></div>
+                      <div><span style={key}>Block ......... </span><span style={val}>#{selectedNode.blockNumber}</span></div>
+                      <div><span style={key}>Time .......... </span><span style={val}>{new Date(selectedNode.timestamp * 1000).toLocaleString()}</span></div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4 }}>TX HASH (on-chain)</div>
+                      <div style={{ fontSize:10, color:'#00d4ff', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.txHash}</div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4 }}>LEAF HASH (keccak256)</div>
+                      <div style={{ fontSize:10, color:'#00ff88', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.hash}</div>
+                      {highlightProof.length > 0 && (
+                        <><div style={divider}></div><div style={{ fontSize:11, color:'#ff7733' }}>🔶 Proof path highlighted in tree ({highlightProof.length} sibling hashes)</div></>
+                      )}
+                    </div>
+                  )}
+
+                  {selectedNode?.type === 'internal' && (
+                    <div style={row}>
+                      <div style={{ fontSize:11, color:'#4a7a9b', letterSpacing:1.5, marginBottom:8 }}>INTERNAL NODE</div>
+                      <div style={{ fontSize:12, color:'#4a7a9b', lineHeight:1.7, marginBottom:8 }}>Formed by hashing two children together. Any change to either child changes this node and propagates all the way to the root.</div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4 }}>NODE HASH</div>
+                      <div style={{ fontSize:10, color:'#0088cc', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.hash}</div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4 }}>LEFT CHILD</div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.left?.hash}</div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4, marginTop:6 }}>RIGHT CHILD</div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.right?.hash}</div>
+                    </div>
+                  )}
+
+                  {selectedNode?.type === 'root' && (
+                    <div style={row}>
+                      <div style={{ fontSize:11, color:'#ffcc00', letterSpacing:1.5, marginBottom:8 }}>🏆 MERKLE ROOT</div>
+                      <div style={{ fontSize:12, color:'#4a7a9b', lineHeight:1.8, marginBottom:8 }}>
+                        Cryptographic fingerprint of <span style={{ color:'#00d4ff' }}>every vote</span> in this election. If any vote is altered, added, or removed — this hash changes completely.
+                      </div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:10, color:'#4a7a9b', letterSpacing:1.5, marginBottom:4 }}>ROOT HASH</div>
+                      <div style={{ fontSize:10, color:'#ffcc00', wordBreak:'break-all', fontFamily:"'Courier New', monospace", lineHeight:1.7 }}>{selectedNode.hash}</div>
+                      <div style={divider}></div>
+                      <div style={{ fontSize:11, color:'#4a7a9b', lineHeight:1.8 }}>
+                        Total votes: <span style={cyan}>{merkleTree?.totalLeaves}</span> &nbsp;·&nbsp;
+                        Tree levels: <span style={cyan}>{merkleTree?.levels.length}</span> &nbsp;·&nbsp;
+                        Algorithm: <span style={cyan}>keccak256</span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* ══ ADMIN TAB ══ */}
         {tab==='admin' && isAdmin && (
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:16, height:'100%' }}>
-
             {/* Phase control */}
             <div style={panel}>
               <div style={ph()}><span style={pt}>Election Phases</span></div>
@@ -568,19 +838,32 @@ export default function Home() {
                   <div><span style={key}>Candidates ..... </span><span style={val}>{candidates.length}</span></div>
                   <div><span style={key}>Total Votes .... </span><span style={green}>{totalVotes}</span></div>
                 </div>
-                {[
-                  { label:'📋 Registration', desc:'Add candidates & authorize voters', i:0, color:'#ffcc00' },
-                  { label:'🗳 Voting',        desc:'Voters cast their votes',           i:1, color:'#00ff88' },
-                  { label:'🏁 Ended',         desc:'Results finalized on chain',        i:2, color:'#4a7a9b' },
-                ].map(p=>(
+                {[{label:'📋 Registration',desc:'Add candidates & authorize voters',i:0,color:'#ffcc00'},{label:'🗳 Voting',desc:'Voters cast their votes',i:1,color:'#00ff88'},{label:'🏁 Ended',desc:'Results finalized on chain',i:2,color:'#4a7a9b'}].map(p=>(
                   <div key={p.i} style={{ padding:'10px 14px', borderRadius:6, border:`1px solid ${phaseNum===p.i?p.color+'55':'#1a3a52'}`, background:phaseNum===p.i?`rgba(${p.i===0?'255,204,0':p.i===1?'0,255,136':'74,122,155'},0.06)`:'#070f1a', marginBottom:8 }}>
                     <div style={{ fontSize:13, fontWeight:700, color:phaseNum===p.i?p.color:'#4a7a9b', fontFamily:"'Segoe UI', sans-serif" }}>{p.label}{phaseNum===p.i?' ← CURRENT':''}</div>
                     <div style={{ fontSize:11, color:'#4a7a9b', marginTop:2 }}>{p.desc}</div>
                   </div>
                 ))}
                 <div style={{ marginTop:'auto', display:'flex', flexDirection:'column', gap:8 }}>
-                  {phaseNum===0 && <button style={mkBtn('green')} onClick={handleStartVoting} disabled={loading}>▶ Start Voting Phase</button>}
-                  {phaseNum===1 && <button style={mkBtn('red')}   onClick={handleEndVoting}   disabled={loading}>■ End Election</button>}
+                  {phaseNum===0 && (
+                    <>
+                      <label style={lbl}>Voting Duration (minutes)</label>
+                      <input type="number" min={1} max={60} value={timerDuration} onChange={e=>setTimerDuration(Math.max(1,Number(e.target.value)))} style={{ ...inp, marginBottom:6 }}/>
+                      <button style={mkBtn('green')} onClick={handleStartVoting} disabled={loading}>▶ Start Voting Phase</button>
+                    </>
+                  )}
+                  {phaseNum===1 && (
+                    <>
+                      {timeLeft !== null && (
+                        <div style={{ padding:'10px 14px', borderRadius:6, border:`1px solid ${timeLeft===0?'#cc1133':'#aa8800'}`, background:timeLeft===0?'rgba(255,51,85,0.07)':'rgba(255,204,0,0.07)', marginBottom:4, textAlign:'center' }}>
+                          <div style={{ fontSize:11, color:'#4a7a9b', letterSpacing:1, marginBottom:4 }}>VOTING TIME REMAINING</div>
+                          <div style={{ fontSize:28, fontWeight:700, color:timeLeft===0?'#ff4466':'#ffcc00', fontFamily:"'Courier New', monospace", letterSpacing:3 }}>{timeLeft===0?'⏰ TIME UP':formatTime(timeLeft)}</div>
+                          {timeLeft===0 && <div style={{ fontSize:11, color:'#ff4466', marginTop:4 }}>Click End Election to finalize results</div>}
+                        </div>
+                      )}
+                      <button style={mkBtn('red')} onClick={handleEndVoting} disabled={loading}>■ End Election</button>
+                    </>
+                  )}
                   {phaseNum===2 && <div style={aInf}>Election ended. Results are final and immutable.</div>}
                   {phaseMsg && <div style={phaseMsg.startsWith('✓')?aOk:aErr}>{phaseMsg}</div>}
                 </div>
@@ -589,17 +872,12 @@ export default function Home() {
 
             {/* Add candidate */}
             <div style={panel}>
-              <div style={ph()}>
-                <span style={pt}>Add Candidate</span>
-                <span style={{ fontSize:11, color:phaseNum===0?'#00ff88':'#ff4466' }}>{phaseNum===0?'● OPEN':'● LOCKED'}</span>
-              </div>
+              <div style={ph()}><span style={pt}>Add Candidate</span><span style={{ fontSize:11, color:phaseNum===0?'#00ff88':'#ff4466' }}>{phaseNum===0?'● OPEN':'● LOCKED'}</span></div>
               <div style={pb}>
                 {phaseNum!==0 && <div style={aWarn}>Candidates can only be added during Registration phase.</div>}
                 <label style={lbl}>Candidate Icon</label>
                 <div style={{ display:'flex', flexWrap:'wrap', gap:6, marginBottom:10 }}>
-                  {CAND_ICONS.map(a=>(
-                    <button key={a} onClick={()=>setCandIcon(a)} style={{ width:38, height:38, borderRadius:12, border:`2px solid ${candIcon===a?'#00d4ff':'#1a3a52'}`, background:candIcon===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:18, cursor:'pointer' }}>{a}</button>
-                  ))}
+                  {CAND_ICONS.map(a=>(<button key={a} onClick={()=>setCandIcon(a)} style={{ width:38, height:38, borderRadius:12, border:`2px solid ${candIcon===a?'#00d4ff':'#1a3a52'}`, background:candIcon===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:18, cursor:'pointer' }}>{a}</button>))}
                 </div>
                 <label style={lbl}>Candidate Name</label>
                 <input style={inp} value={candName} onChange={e=>setCandName(e.target.value)} placeholder="e.g. Kruti Bagwe" disabled={phaseNum!==0}/>
@@ -613,11 +891,7 @@ export default function Home() {
                   <>
                     <div style={divider}></div>
                     <div style={{ fontSize:11, color:'#4a7a9b', marginBottom:6, letterSpacing:1 }}>REGISTERED ({candidates.length})</div>
-                    {candidates.map((c,i)=>(
-                      <div key={c.id} style={{ padding:'6px 10px', background:'#070f1a', border:'1px solid #1a3a52', borderRadius:5, marginBottom:5, fontSize:13, color:COLORS[i%COLORS.length] }}>
-                        {c.name} <span style={{ color:'#4a7a9b', fontSize:11 }}>· {c.party}</span>
-                      </div>
-                    ))}
+                    {candidates.map((c,i)=>(<div key={c.id} style={{ padding:'6px 10px', background:'#070f1a', border:'1px solid #1a3a52', borderRadius:5, marginBottom:5, fontSize:13, color:COLORS[i%COLORS.length] }}>{c.name} <span style={{ color:'#4a7a9b', fontSize:11 }}>· {c.party}</span></div>))}
                   </>
                 )}
               </div>
@@ -625,16 +899,11 @@ export default function Home() {
 
             {/* Authorize voter */}
             <div style={panel}>
-              <div style={ph()}>
-                <span style={pt}>Authorize Voter</span>
-                <span style={{ fontSize:11, ...green }}>● ALWAYS OPEN</span>
-              </div>
+              <div style={ph()}><span style={pt}>Authorize Voter</span><span style={{ fontSize:11, ...green }}>● ALWAYS OPEN</span></div>
               <div style={pb}>
                 <label style={lbl}>Voter Avatar</label>
                 <div style={{ display:'flex', flexWrap:'wrap', gap:5, marginBottom:10 }}>
-                  {AVATARS.map(a=>(
-                    <button key={a} onClick={()=>setVAvatar(a)} style={{ width:36, height:36, borderRadius:14, border:`2px solid ${vAvatar===a?'#00d4ff':'#1a3a52'}`, background:vAvatar===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:16, cursor:'pointer' }}>{a}</button>
-                  ))}
+                  {AVATARS.map(a=>(<button key={a} onClick={()=>setVAvatar(a)} style={{ width:36, height:36, borderRadius:14, border:`2px solid ${vAvatar===a?'#00d4ff':'#1a3a52'}`, background:vAvatar===a?'rgba(0,212,255,0.1)':'#070f1a', fontSize:16, cursor:'pointer' }}>{a}</button>))}
                 </div>
                 <label style={lbl}>Full Name</label>
                 <input style={inp} value={vName} onChange={e=>setVName(e.target.value)} placeholder="e.g. Tanmay Bhatkar"/>
@@ -643,9 +912,7 @@ export default function Home() {
                 <label style={lbl}>Wallet Address</label>
                 <select style={{ ...inp }} value={vAddr} onChange={e=>setVAddr(e.target.value)}>
                   <option value="">-- Select demo voter --</option>
-                  {DEMO_VOTERS.map(v=>(
-                    <option key={v.address} value={v.address}>{v.label} · {maskAddress(v.address)}</option>
-                  ))}
+                  {DEMO_VOTERS.map(v=>(<option key={v.address} value={v.address}>{v.label} · {maskAddress(v.address)}</option>))}
                   <option value="custom">Custom address...</option>
                 </select>
                 {vAddr==='custom' && <input style={inp} placeholder="0x..." onChange={e=>setVAddr(e.target.value)}/>}
@@ -655,7 +922,6 @@ export default function Home() {
                 </div>
               </div>
             </div>
-
           </div>
         )}
       </div>
